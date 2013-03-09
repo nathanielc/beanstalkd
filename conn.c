@@ -9,7 +9,7 @@
 
 #define SAFETY_MARGIN (1000000000) /* 1 second */
 
-static int cur_conn_ct = 0, cur_worker_ct = 0, cur_producer_ct = 0;
+static int cur_conn_ct = 0, cur_worker_ct = 0, cur_producer_ct = 0, cur_replicator_ct = 0;
 static uint tot_conn_ct = 0;
 int verbose = 0;
 
@@ -51,6 +51,8 @@ make_conn(int fd, char start_state, tube use, tube watch)
     c->tickpos = -1;
     j = &c->reserved_jobs;
     j->prev = j->next = j;
+    j = &c->replicated_jobs;
+    j->prev = j->next = j;
 
     /* stats */
     cur_conn_ct++;
@@ -75,6 +77,15 @@ connsetworker(Conn *c)
     cur_worker_ct++; /* stats */
 }
 
+void
+connsetreplicator(Conn *c)
+{
+    if (c->type & CONN_TYPE_REPLICATOR) return;
+    c->type |= CONN_TYPE_REPLICATOR;
+    cur_replicator_ct++; /* stats */
+}
+
+
 int
 count_cur_conns()
 {
@@ -97,6 +108,11 @@ int
 count_cur_workers()
 {
     return cur_worker_ct;
+}
+int
+count_cur_replicators()
+{
+    return cur_replicator_ct;
 }
 
 static int
@@ -227,6 +243,10 @@ connclose(Conn *c)
 
     if (c->type & CONN_TYPE_PRODUCER) cur_producer_ct--; /* stats */
     if (c->type & CONN_TYPE_WORKER) cur_worker_ct--; /* stats */
+    if (c->type & CONN_TYPE_REPLICATOR){
+        cur_replicator_ct--; /* stats */
+        enqueue_replicated_jobs(c);
+    }
 
     cur_conn_ct--; /* stats */
 

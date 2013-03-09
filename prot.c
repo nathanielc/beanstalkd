@@ -47,6 +47,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define CMD_STATS_TUBE "stats-tube "
 #define CMD_QUIT "quit"
 #define CMD_PAUSE_TUBE "pause-tube"
+#define CMD_REPLICATE "replicate "
 
 #define CONSTSTRLEN(m) (sizeof(m) - 1)
 
@@ -72,6 +73,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define CMD_LIST_TUBES_WATCHED_LEN CONSTSTRLEN(CMD_LIST_TUBES_WATCHED)
 #define CMD_STATS_TUBE_LEN CONSTSTRLEN(CMD_STATS_TUBE)
 #define CMD_PAUSE_TUBE_LEN CONSTSTRLEN(CMD_PAUSE_TUBE)
+#define CMD_REPLICATE_LEN CONSTSTRLEN(CMD_REPLICATE)
 
 #define MSG_FOUND "FOUND"
 #define MSG_NOTFOUND "NOT_FOUND\r\n"
@@ -85,6 +87,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define MSG_TOUCHED "TOUCHED\r\n"
 #define MSG_BURIED_FMT "BURIED %"PRIu64"\r\n"
 #define MSG_INSERTED_FMT "INSERTED %"PRIu64"\r\n"
+#define MSG_REPLICATED_FMT "REPLICATED %"PRIu64"\r\n"
 #define MSG_NOT_IGNORED "NOT_IGNORED\r\n"
 
 #define MSG_NOTFOUND_LEN CONSTSTRLEN(MSG_NOTFOUND)
@@ -109,6 +112,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define STATE_SENDWORD 3
 #define STATE_WAIT 4
 #define STATE_BITBUCKET 5
+#define STATE_WANTREPLDATA 6
 
 #define OP_UNKNOWN 0
 #define OP_PUT 1
@@ -135,7 +139,8 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define OP_QUIT 22
 #define OP_PAUSE_TUBE 23
 #define OP_JOBKICK 24
-#define TOTAL_OPS 25
+#define OP_REPLICATE 25
+#define TOTAL_OPS 26
 
 #define STATS_FMT "---\n" \
     "current-jobs-urgent: %u\n" \
@@ -143,6 +148,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
     "current-jobs-reserved: %u\n" \
     "current-jobs-delayed: %u\n" \
     "current-jobs-buried: %u\n" \
+    "current-jobs-replicated: %u\n" \
     "cmd-put: %" PRIu64 "\n" \
     "cmd-peek: %" PRIu64 "\n" \
     "cmd-peek-ready: %" PRIu64 "\n" \
@@ -165,6 +171,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
     "cmd-list-tube-used: %" PRIu64 "\n" \
     "cmd-list-tubes-watched: %" PRIu64 "\n" \
     "cmd-pause-tube: %" PRIu64 "\n" \
+    "cmd-replicate: %" PRIu64 "\n" \
     "job-timeouts: %" PRIu64 "\n" \
     "total-jobs: %" PRIu64 "\n" \
     "max-job-size: %zu\n" \
@@ -172,6 +179,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
     "current-connections: %u\n" \
     "current-producers: %u\n" \
     "current-workers: %u\n" \
+    "current-replicators: %u\n" \
     "current-waiting: %u\n" \
     "total-connections: %u\n" \
     "pid: %ld\n" \
@@ -195,6 +203,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
     "current-jobs-reserved: %u\n" \
     "current-jobs-delayed: %u\n" \
     "current-jobs-buried: %u\n" \
+    "current-jobs-replicated: %u\n" \
     "total-jobs: %" PRIu64 "\n" \
     "current-using: %u\n" \
     "current-watching: %u\n" \
@@ -272,6 +281,7 @@ static const char * op_names[] = {
     CMD_QUIT,
     CMD_PAUSE_TUBE,
     CMD_JOBKICK,
+    CMD_REPLICATE,
 };
 
 static job remove_buried_job(job j);
@@ -388,6 +398,46 @@ reserve_job(Conn *c, job j)
     }
     return reply_job(c, j, MSG_RESERVED);
 }
+
+static void
+store_replicated_job(Conn *c, job j)
+{
+    j->r.state = Replicated;
+    job_insert(&c->replicated_jobs, j);
+
+    global_stat.replicated_ct++; /* stats */
+    j->tube->stat.replicated_ct++;
+    global_stat.total_jobs_ct++;
+    j->tube->stat.total_jobs_ct++;
+
+    return reply_line(c, STATE_SENDWORD, MSG_REPLICATED_FMT, j->r.id);
+}
+
+static void
+store_incoming_replicated_job(Conn *c)
+{
+
+    job j = c->in_job;
+
+    c->in_job = NULL; /* the connection no longer owns this job */
+    c->in_job_read = 0;
+
+    /* check if the trailer is present and correct */
+    if (memcmp(j->body + j->r.body_size - 2, "\r\n", 2)) {
+      job_free(j);
+      return reply_msg(c, MSG_EXPECTED_CRLF);
+    }
+
+    if (verbose >= 2) {
+      printf("<%d job replicated %"PRIu64"\n", c->sock.fd, j->r.id);
+    }
+
+    /* we have a complete job, so let's stick it in the linked list of replicated jobs */
+    store_replicated_job(c, j);
+}
+
+
+
 
 static job
 next_eligible_job(int64 now)
@@ -524,6 +574,24 @@ enqueue_reserved_jobs(Conn *c)
         j->tube->stat.reserved_ct--;
         c->soonest_job = NULL;
     }
+}
+
+
+void
+enqueue_replicated_jobs(Conn *c)
+{
+    int r;
+    job j;
+
+    while (job_list_any_p(&c->replicated_jobs)) {
+        j = job_remove(c->replicated_jobs.next);
+        r = enqueue_job(c->srv, j, 0, 0);
+        if (r < 1) bury_job(c->srv, j, 0);
+        global_stat.replicated_ct--;
+        j->tube->stat.replicated_ct--;
+        c->soonest_job = NULL;
+    }
+
 }
 
 static job
@@ -761,6 +829,7 @@ which_cmd(Conn *c)
     TEST_CMD(c->cmd, CMD_LIST_TUBES, OP_LIST_TUBES);
     TEST_CMD(c->cmd, CMD_QUIT, OP_QUIT);
     TEST_CMD(c->cmd, CMD_PAUSE_TUBE, OP_PAUSE_TUBE);
+    TEST_CMD(c->cmd, CMD_REPLICATE, OP_REPLICATE);
     return OP_UNKNOWN;
 }
 
@@ -888,6 +957,7 @@ fmt_stats(char *buf, size_t size, void *x)
             global_stat.reserved_ct,
             get_delayed_job_ct(),
             global_stat.buried_ct,
+            global_stat.replicated_ct,
             op_ct[OP_PUT],
             op_ct[OP_PEEKJOB],
             op_ct[OP_PEEK_READY],
@@ -910,6 +980,7 @@ fmt_stats(char *buf, size_t size, void *x)
             op_ct[OP_LIST_TUBE_USED],
             op_ct[OP_LIST_TUBES_WATCHED],
             op_ct[OP_PAUSE_TUBE],
+            op_ct[OP_REPLICATE],
             timeout_ct,
             global_stat.total_jobs_ct,
             job_data_size_limit,
@@ -917,6 +988,7 @@ fmt_stats(char *buf, size_t size, void *x)
             count_cur_conns(),
             count_cur_producers(),
             count_cur_workers(),
+            count_cur_replicators(),
             global_stat.waiting_ct,
             count_tot_conns(),
             (long) getpid(),
@@ -961,6 +1033,7 @@ read_pri(uint *pri, const char *buf, char **end)
     if (end) *end = tend;
     return 0;
 }
+
 
 /* Read a delay value from the given buffer and place it in delay.
  * The interface and behavior are analogous to read_pri(). */
@@ -1122,6 +1195,7 @@ fmt_stats_tube(char *buf, size_t size, tube t)
             t->stat.reserved_ct,
             t->delay.len,
             t->stat.buried_ct,
+            t->stat.replicated_ct,
             t->stat.total_jobs_ct,
             t->using_ct,
             t->watching_ct,
@@ -1142,6 +1216,18 @@ maybe_enqueue_incoming_job(Conn *c)
 
     /* otherwise we have incomplete data, so just keep waiting */
     c->state = STATE_WANTDATA;
+}
+
+static void
+maybe_store_replicated_job(Conn *c)
+{
+    job j = c->in_job;
+
+   /* do we have a complete job? */
+   if (c->in_job_read == j->r.body_size) return store_incoming_replicated_job(c);
+
+   /* otherwise we have incomplete data, so just keep waiting */
+   c->state = STATE_WANTREPLDATA;
 }
 
 /* j can be NULL */
@@ -1249,6 +1335,61 @@ dispatch_cmd(Conn *c)
 
         /* it's possible we already have a complete job */
         maybe_enqueue_incoming_job(c);
+
+        break;
+    case OP_REPLICATE:
+    	r = read_tube_name(&name, c->cmd + CMD_REPLICATE_LEN, &pri_buf);
+        if (r) return reply_msg(c, MSG_BAD_FORMAT);
+
+        r = read_pri(&pri, pri_buf, &delay_buf);
+        if (r) return reply_msg(c, MSG_BAD_FORMAT);
+
+        r = read_delay(&delay, delay_buf, &ttr_buf);
+        if (r) return reply_msg(c, MSG_BAD_FORMAT);
+
+        r = read_ttr(&ttr, ttr_buf, &size_buf);
+        if (r) return reply_msg(c, MSG_BAD_FORMAT);
+
+        errno = 0;
+        body_size = strtoul(size_buf, &end_buf, 10);
+        if (errno) return reply_msg(c, MSG_BAD_FORMAT);
+
+        op_ct[type]++;
+
+
+        *pri_buf = '\0';
+	    TUBE_ASSIGN(t, tube_find_or_make(name));
+	    if (!t) return reply_serr(c, MSG_OUT_OF_MEMORY);
+
+        if (body_size > job_data_size_limit) {
+            /* throw away the job body and respond with JOB_TOO_BIG */
+            return skip(c, body_size + 2, MSG_JOB_TOO_BIG);
+        }
+
+        /* don't allow trailing garbage */
+        if (end_buf[0] != '\0') return reply_msg(c, MSG_BAD_FORMAT);
+
+        connsetreplicator(c);
+
+        if (ttr < 1000000000) {
+            ttr = 1000000000;
+        }
+
+        c->in_job = make_job(pri, delay, ttr, body_size + 2, c->use);
+
+        /* OOM? */
+        if (!c->in_job) {
+            /* throw away the job body and respond with OUT_OF_MEMORY */
+            twarnx("server error: " MSG_OUT_OF_MEMORY);
+            return skip(c, body_size + 2, MSG_OUT_OF_MEMORY);
+        }
+
+
+        fill_extra_data(c);
+
+        /* it's possible we already have a complete job */
+        maybe_store_replicated_job(c);
+
 
         break;
     case OP_PEEK_READY:
@@ -1720,6 +1861,7 @@ conn_data(Conn *c)
         }
         break;
     case STATE_WANTDATA:
+    case STATE_WANTREPLDATA:
         j = c->in_job;
 
         r = read(c->sock.fd, j->body + c->in_job_read, j->r.body_size -c->in_job_read);
@@ -1730,7 +1872,10 @@ conn_data(Conn *c)
 
         /* (j->in_job_read > j->r.body_size) can't happen */
 
-        maybe_enqueue_incoming_job(c);
+        if (c->state == STATE_WANTDATA)
+            maybe_enqueue_incoming_job(c);
+        else
+            maybe_store_replicated_job(c);
         break;
     case STATE_SENDWORD:
         r= write(c->sock.fd, c->reply + c->reply_sent, c->reply_len - c->reply_sent);

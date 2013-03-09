@@ -51,6 +51,7 @@ typedef int(FAlloc)(int, int);
 #define CONN_TYPE_PRODUCER 1
 #define CONN_TYPE_WORKER   2
 #define CONN_TYPE_WAITING  4
+#define CONN_TYPE_REPLICATOR 8
 
 #define min(a,b) ((a)<(b)?(a):(b))
 
@@ -69,6 +70,7 @@ struct stats {
     uint waiting_ct;
     uint buried_ct;
     uint reserved_ct;
+    uint replicated_ct;
     uint pause_ct;
     uint64   total_delete_ct;
     uint64   total_jobs_ct;
@@ -114,6 +116,7 @@ enum // Jobrec.state
     Reserved,
     Buried,
     Delayed,
+    Replicated,
     Copy
 };
 
@@ -239,6 +242,7 @@ int count_cur_conns(void);
 uint count_tot_conns(void);
 int count_cur_producers(void);
 int count_cur_workers(void);
+int count_cur_replicators(void);
 
 
 extern size_t primes[];
@@ -253,6 +257,7 @@ void protrmdirty(Conn*);
 Conn *remove_waiting_conn(Conn *c);
 
 void enqueue_reserved_jobs(Conn *c);
+void enqueue_replicated_jobs(Conn *c);
 
 void enter_drain_mode(int sig);
 void h_accept(const int fd, const short which, Server* srv);
@@ -298,6 +303,7 @@ struct Conn {
 
     struct ms  watch;
     struct job reserved_jobs; // linked list header
+    struct job replicated_jobs; // linked list header
 };
 int  connless(Conn *a, Conn *b);
 void connrec(Conn *c, int i);
@@ -306,6 +312,7 @@ void connsched(Conn *c);
 void connclose(Conn *c);
 void connsetproducer(Conn *c);
 void connsetworker(Conn *c);
+void connsetreplicator(Conn *c);
 job  connsoonestjob(Conn *c);
 int  conndeadlinesoon(Conn *c);
 int conn_ready(Conn *c);

@@ -203,6 +203,7 @@ job_state(job j)
     if (j->r.state == Reserved) return "reserved";
     if (j->r.state == Buried) return "buried";
     if (j->r.state == Delayed) return "delayed";
+    if (j->r.state == Replicated) return "replicated";
     return "invalid";
 }
 
